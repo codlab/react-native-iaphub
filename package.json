@@ -3,7 +3,7 @@
   "version": "6.3.0",
   "description": "The easiest way to implement IAP (In-app purchase) in your React Native app",
   "main": "src/index.js",
-  "license": "GNU GPL V3.0",
+  "license": "MIT",
   "keywords": [
     "react-native",
     "in app purchase",
