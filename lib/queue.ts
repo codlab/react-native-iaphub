@@ -1,31 +1,34 @@
+export interface Executor<T, OUT> {
+  (item: T): OUT
+}
 
-export default class Queue {
+export default class Queue<T, OUT> {
 
-  constructor(executor) {
-    this.executor = executor;
-    this.waiting = [];
-    this.isRunning = false;
-    this.isPaused = false;
+  private waiting: T[] = [];
+  private isRunning = false;
+  private isPaused = false;
+
+  constructor(private executor: Executor<T, OUT>) {
   }
   
-  add(item) {
+  public add(item: T) {
     this.waiting.push(item);
     this.run();
   }
 
-  pause() {
+  public pause() {
     this.isPaused = true;
   }
 
-  async resume() {
+  public async resume() {
     this.isPaused = false;
     await this.run();
   }
 
-  async run() {
+  private async run() {
     if (this.isPaused || this.isRunning) return;
     // Get the items we're going to process, empty waiting list and mark the queue as running
-    var items = [].concat(this.waiting);
+    var items = this.waiting;
     this.waiting = [];
     this.isRunning = true;
     // Execute items in the waiting list

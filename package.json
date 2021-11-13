@@ -2,7 +2,7 @@
   "name": "react-native-iaphub",
   "version": "6.3.0",
   "description": "The easiest way to implement IAP (In-app purchase) in your React Native app",
-  "main": "src/index.js",
+  "main": "build/index.js",
   "license": "MIT",
   "keywords": [
     "react-native",
@@ -23,10 +23,12 @@
     "react-native": "*",
     "react-native-iap": "5.2.6"
   },
-  "devDependencies": {},
   "dependencies": {
     "fetch-retry": "4.1.0",
     "react-native-event-listeners": "1.0.7",
     "react-native-fetch-polyfill": "1.1.3"
+  },
+  "devDependencies": {
+    "@types/react-native": "*"
   }
 }

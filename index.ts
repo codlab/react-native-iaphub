@@ -1,39 +1,90 @@
-import { Platform, AppState, NativeModules, NativeEventEmitter } from "react-native";
+import { Platform, AppState, NativeModules, NativeEventEmitter, AppStateStatus, EmitterSubscription } from "react-native";
 import * as RNIap from "react-native-iap";
 import { EventRegister } from 'react-native-event-listeners';
+//@ts-ignore
 import fetch from 'react-native-fetch-polyfill';
-import Queue from './queue';
-import pkg from '../package.json';
+import Queue from './lib/queue';
+import pkg from "./package.json";
+import { ExtendedError, IapHubPurchaseErrorCodes, ParamsError } from "./lib/ExtendedError";
+import { IapHubInitOptions } from "./lib/InitOptions";
+import { IapHubActiveProductsOptions, IapHubIntroductoryPaymentType, IapHubProductInformation, IapHubProductTypes, IapHubReceipt, IapHubSubscriptionPeriod, ReceiptProcessor } from "./lib/Products";
+import { AndroidProrationModes, BuyPromiseHolder, IapHubBuyOptions, ProrationModes } from "./lib/Buy";
+import { EventsMap } from "./lib/Events";
+import { IapHubDeviceParams, IapHubUserTags } from "./lib/Information";
 
 // Prevent "Require cycle" warning triggered by react-native-fetch-polyfill
 const RequestObject = Request;
 // Add retry functionality to the fetch API
 const fetchWithRetry = require('fetch-retry')(fetch);
 
-class Iaphub {
+interface ProductPricing {
+  id: string,
+  price: number,
+  currency: string,
+  introPrice?: number
+}
 
-  constructor() {
-    this.apiUrl = "https://api.iaphub.com/v1";
-    this.platform = Platform.OS;
-    this.products = [];
-    this.productsPricing = null;
-    this.appId = null;
-    this.apiKey = null;
-    this.userId = null;
-    this.user = null;
-    this.userFetchDate = null;
-    this.userFetchPromises = [];
-    this.userTagsProcessing = false;
-    this.deviceParams = {};
-    this.receiptPostDate = null;
-    this.isInitialized = false;
-    this.isRestoring = false;
-    this.canMakePayments = true;
-    this.onReceiptProcessed = null;
-    this.buyRequest = null;
-    this.lastReceiptInfos = null;
-    this.receiptQueue = new Queue(this.processReceipt.bind(this));
-    this.errorQueue = new Queue(this.processError.bind(this));
+interface IapHubTransaction {
+  sku: string,
+  type?: IapHubProductTypes
+}
+
+type Purchase = RNIap.ProductPurchase|RNIap.SubscriptionPurchase;
+
+interface InternalReceipt {
+  date: Date,
+  purchase: Purchase,
+  context?: string
+}
+
+interface IapHubUser {
+  productsForSale: IapHubProductInformation[];
+  activeProducts: IapHubProductInformation[];
+}
+
+interface LastReceiptInfo {
+  date: Date,
+  token: string,
+  shouldFinishReceipt: boolean,
+  productType?: IapHubProductTypes|null
+}
+
+export default class Iaphub {
+
+  private apiUrl = "https://api.iaphub.com/v1";
+  private platform = Platform.OS;
+  private receiptQueue = new Queue(this.processReceipt.bind(this));
+  private errorQueue = new Queue(this.processError.bind(this));
+  private userTagsProcessing = false;
+  private isInitialized = false;
+  private isRestoring = false;
+  private canMakePayments = false;
+  private userFetchDate?: Date|null;
+  private receiptPostDate?: Date|null;
+  private lastReceiptInfos?: LastReceiptInfo|null;
+
+  private appId?: string;
+  private apiKey?: string;
+  private environment?: string;
+  private userId?: string;
+  private user?: IapHubUser|null;
+  private userFetchPromises: ({ resolve: (user: IapHubUser) => void, reject: (err: Error) => void })[] = [];
+
+  private onReceiptProcessed?: ReceiptProcessor;
+  private productsPricing?: ProductPricing[];
+
+  private appState?: AppStateStatus;
+  private resumeQueuesTimeout?: NodeJS.Timeout;
+
+  private purchaseUpdatedListener?: EmitterSubscription;
+  private purchaseErrorListener?: EmitterSubscription;
+  private promotedProductListener?: EmitterSubscription;
+
+  private buyRequest?: BuyPromiseHolder|null;
+
+  private deviceParams?: any = {};
+
+  constructor(private version: string) {
     // Pause queues until the user is authenticated
     this.pauseQueues();
   }
@@ -48,7 +99,8 @@ class Iaphub {
    * @param {String} opts.environment - App environment
    * @param {Function} opts.onReceiptProcessed - Event triggered after IAPHUB processed a receipt
    */
-  async init(opts = {}) {
+  async init(opts: IapHubInitOptions) {
+    if (!opts) throw this.error("Missing init options", "options_empty");
     if (!opts.appId) {
       throw this.error("Missing appId option", "app_id_empty");
     }
@@ -65,10 +117,10 @@ class Iaphub {
     try {
       var status = await RNIap.initConnection();
       // On ios initConnection will return the result of canMakePayments
-      if (this.platform == "ios" && status == "false") {
+      if (this.platform == "ios" && !status) {
         this.canMakePayments = false;
       }
-    } catch (err) {
+    } catch (err: any) {
       // Check init connection errors
       if (err.message.indexOf("Billing is unavailable") != -1) {
         throw this.error(`The billing is not available`, "billing_unavailable");
@@ -96,7 +148,7 @@ class Iaphub {
     if (!this.purchaseUpdatedListener) {
       this.purchaseUpdatedListener = RNIap.purchaseUpdatedListener((purchase) => {
         // Add receipt to the queue
-        this.receiptQueue.add({date: new Date(), purchase: purchase})
+        this.receiptQueue.add({date: new Date(), purchase})
         // Resume queues in case it was paused
         this.resumeQueues();
       });
@@ -129,8 +181,9 @@ class Iaphub {
    * @param {String} name Event name
    * @param {Function} listener Event callback
    */
-  addEventListener(name, listener) {
-    return EventRegister.addEventListener(name, listener);
+  addEventListener<K extends keyof EventsMap>(name: K, listener: EventsMap[K]): string|undefined {
+    const result = EventRegister.addEventListener(name, listener);
+    return (typeof result == "string") ? result : undefined;
   }
 
   /*
@@ -138,7 +191,7 @@ class Iaphub {
    * @param {String} name Event name
    * @param {Function} callback Event callback
    */
-  removeEventListener(listener) {
+  removeEventListener(listener: string) {
     return EventRegister.removeEventListener(listener);
   }
 
@@ -149,11 +202,16 @@ class Iaphub {
     return EventRegister.removeAllListeners();
   }
 
-  /*
-   * Set user id (or device id)
-   * @param {String} userId User id
+  /***
+   * Call the `setUserId` method to authenticate an user.
+   *
+   * If you have an authentication system, provide the `user id` of the user right after the user log in.
+   * If you don't and want to handle IAP on the client side, you can provide the `device id` when the app start instead by using a module such as [react-native-device-info](https://github.com/react-native-community/react-native-device-info#getuniqueid) to get a device unique ID.
+   *
+   * ⚠ You should provide an id that is non-guessable and isn't public. (Email not allowed)
+   * @param {String} userId Non-guessable unique identifier of user
    */
-  setUserId(userId) {
+  setUserId(userId: string) {
     if (!this.isInitialized) {
       throw this.error("IAPHUB hasn't been initialized", "init_missing");
     }
@@ -173,19 +231,22 @@ class Iaphub {
 	 * @param {Number} opts.prorationMode - Proration mode when upgrading/downgrading subscription (Android only)
    * @param {Boolean} opts.crossPlatformConflict - Enable/disable the security throwing an error if an active product on a different platform is detected
    */
-  async buy(sku, opts = {}) {
+  public async buy(sku: string, opts: IapHubBuyOptions = {}): Promise<IapHubProductInformation|undefined> {
     // The user id has to be set
     if (!this.userId) {
       throw this.error("User id required", "user_id_required");
     }
     // Refresh user
     await this.refreshUser();
-    // Get product of the sku
-    var product = this.user.productsForSale.find((product) => product.sku == sku);
-    // If the product isn't found look in active products
-    if (!product) {
-      product = this.user.activeProducts.find((product) => product.sku == sku);
+    if (!this.user) {
+      throw this.error("Invalid user state", "user_state_required");
     }
+
+    // Get product of the sku
+    const product = this.user.productsForSale.find((product) => product.sku == sku)
+      //    If the product isn't found look in active products
+      || this.user.activeProducts.find((product) => product.sku == sku);
+
     // Prevent buying a product that isn't in the products for sale list
     if (!product) {
       throw this.error(
@@ -204,11 +265,11 @@ class Iaphub {
     }
     // Support proration mode
     if (typeof opts.androidProrationMode != 'undefined') {
-      var prorationModes = {1: 'immediate_with_time_proration', 2: 'immediate_and_charge_prorated_price', 3: 'immediate_without_proration', 4: 'deferred'};
-      opts.prorationMode = prorationModes[opts.androidProrationMode];
+      var androidProrationModes: AndroidProrationModes = {1: 'immediate_with_time_proration', 2: 'immediate_and_charge_prorated_price', 3: 'immediate_without_proration', 4: 'deferred'};
+      opts.prorationMode = androidProrationModes[opts.androidProrationMode];
     }
     else if (typeof opts.prorationMode != 'undefined') {
-      var prorationModes = {'immediate_with_time_proration': 1, 'immediate_and_charge_prorated_price': 2, 'immediate_without_proration': 3, 'deferred': 4};
+      var prorationModes: ProrationModes = {'immediate_with_time_proration': 1, 'immediate_and_charge_prorated_price': 2, 'immediate_without_proration': 3, 'deferred': 4};
       opts.androidProrationMode = prorationModes[opts.prorationMode];
       if (!opts.androidProrationMode) {
         throw this.error(
@@ -218,8 +279,8 @@ class Iaphub {
       }
     }
     // Create promise than will be resolved (or rejected) after process of the receipt is complete
-    var buyPromise = new Promise((resolve, reject) => {
-      this.buyRequest = {resolve, reject, sku, opts: opts};
+    var buyPromise = new Promise<IapHubProductInformation|undefined>((resolve, reject) => {
+      this.buyRequest = {resolve, reject, sku, opts};
     });
     // Request purchase
     try {
@@ -231,7 +292,7 @@ class Iaphub {
         });
         // On android we need to provide the old sku if it is an upgrade/downgrade
         if (this.platform == 'android' && activeSubscription && activeSubscription.sku != product.sku) {
-          this.buyRequest.prorationMode = opts.prorationMode;
+          !!this.buyRequest && (this.buyRequest.prorationMode = opts.prorationMode);
           await RNIap.requestSubscription(product.sku, false, activeSubscription.sku, activeSubscription.androidToken, opts.androidProrationMode || 1);
         }
         // Otherwise request subscription normally
@@ -245,7 +306,7 @@ class Iaphub {
       }
     }
     // Add error to queue
-    catch (err) {
+    catch (err: any) {
       this.errorQueue.add(err);
     }
     // Return promise
@@ -257,7 +318,9 @@ class Iaphub {
    * @param {Object} opts Options
 	 * @param {Array} opts.includeSubscriptionStates - Include subscription states (only 'active' and 'grace_period' states are returned by default)
    */
-  async getActiveProducts(opts = {}) {
+  public async getActiveProducts(opts?: IapHubActiveProductsOptions): Promise<IapHubProductInformation[]> {
+    if(!opts) opts = { includeSubscriptionStates: [] };
+
     var userFetched = false;
     var subscriptionStates = ['active', 'grace_period'].concat(opts.includeSubscriptionStates || []);
 
@@ -265,13 +328,14 @@ class Iaphub {
     userFetched = await this.refreshUser();
     // Refresh the user if that's not already the case
     if (!userFetched) {
-      var subscriptions = this.user.activeProducts.filter((item) => item.type == 'renewable_subscription');
+      var subscriptions = this.user?.activeProducts.filter((item) => item.type == 'renewable_subscription');
       // If we have active renewable subscriptions, refresh every minute
-      if (subscriptions.length) {
+      if (subscriptions && subscriptions.length) {
         await this.refreshUser({interval: 1000 * 60});
       }
     }
     // Filter subscriptions states, return only 'active' and 'grace_period' states by default which are the states when the subscription is truly active
+    if (!this.user) return [];
     return this.user.activeProducts.filter((product) => {
       // Return product if it has no state
       if (!product.subscriptionState) return true;
@@ -283,17 +347,19 @@ class Iaphub {
   /*
    * Get products for sale
    */
-  async getProductsForSale() {
+  async getProductsForSale(): Promise<IapHubProductInformation[]> {
     // Refresh user every minute
     await this.refreshUser({interval: 1000 * 60});
+
     // Return products for sale
+    if (!this.user) return [];
     return this.user.productsForSale;
   }
 
   /*
    * Refresh user (only when needed)
    */
-  async refreshUser(opts = {}) {
+  private async refreshUser(opts: { interval?: number, force?: boolean } = {}) {
     var fetched = false;
 
     // Refresh user every 24 hours by default
@@ -336,7 +402,7 @@ class Iaphub {
   /*
    * Fetch user
    */
-  async fetchUser() {
+  private async fetchUser() {
     // Keep a list of promises in order to handle concurrent requests
     var promise = new Promise((resolve, reject) => this.userFetchPromises.push({resolve, reject}));
     if (this.userFetchPromises.length > 1) return promise;
@@ -354,14 +420,14 @@ class Iaphub {
           "unexpected_response"
         );
       }
-      var products = [].concat(data.productsForSale).concat(data.activeProducts);
+      var products: IapHubProductInformation[] = [].concat(data.productsForSale).concat(data.activeProducts);
       var productIds = products
         .filter(item => item.sku && item.type.indexOf("renewable_subscription") == -1)
         .map(item => item.sku);
       var subscriptionIds = products
         .filter(item => item.sku && item.type.indexOf("renewable_subscription") != -1)
         .map(item => item.sku);
-      var productsInfos = [];
+      var productsInfos: (RNIap.Subscription|RNIap.Product)[] = [];
 
       try {
         if (productIds.length) {
@@ -376,7 +442,7 @@ class Iaphub {
         console.error(err);
       }
 
-      var convertToISO8601 = (numberOfPeriods, periodType) => {
+      var convertToISO8601 = (numberOfPeriods: string|null|undefined, periodType?: '' | 'YEAR' | 'MONTH' | 'WEEK' | 'DAY') => {
         if (!numberOfPeriods || !periodType) {
           return undefined;
         }
@@ -390,8 +456,10 @@ class Iaphub {
         return periodTypes[periodType];
       }
 
-      var formatProduct = (product, filterProductNotFound) => {
+      var formatProduct = (product: IapHubProductInformation, filterProductNotFound?: boolean): IapHubProductInformation|null => {
         var infos = productsInfos.find(info => info.productId == product.sku);
+        const infosAsSubscription = infos as RNIap.Subscription;
+        const infoAsProduct = infos as RNIap.Product<string>;
 
         if (!infos) {
           // If the product wasn't found but the filter isn't enabled return the few infos we have about the product coming from the API
@@ -428,33 +496,36 @@ class Iaphub {
             subscriptionDuration: (() => {
               // Ios
               if (this.platform == "ios") {
-                return convertToISO8601(infos.subscriptionPeriodNumberIOS, infos.subscriptionPeriodUnitIOS);
+                return convertToISO8601(infosAsSubscription.subscriptionPeriodNumberIOS, infosAsSubscription.subscriptionPeriodUnitIOS) as IapHubSubscriptionPeriod;
               }
               // Android
               else if (this.platform == "android") {
-                return infos.subscriptionPeriodAndroid;
+                return infosAsSubscription.subscriptionPeriodAndroid as IapHubSubscriptionPeriod;
               }
             })()
           } : {}),
           // Only for a renewable subscription with an intro mode
           ...((product.type == "renewable_subscription" && product.subscriptionPeriodType == 'intro') ? {
             // Localized introductory price
-            subscriptionIntroPrice: infos.introductoryPrice,
+            subscriptionIntroPrice: parseFloat(infosAsSubscription.introductoryPrice || "0"),
             // Introductory price amount
-            subscriptionIntroPriceAmount: infos.introductoryPrice ? parseFloat(infos.introductoryPrice.match(/\b\d+(?:.\d+)?/)[0]) : undefined,
+            subscriptionIntroPriceAmount: infosAsSubscription.introductoryPrice ? parseFloat((infosAsSubscription.introductoryPrice.match(/\b\d+(?:.\d+)?/) || [])[0]) : undefined,
             // Payment type of the introductory offer
             subscriptionIntroPayment: (() => {
               // Ios
               if (this.platform == "ios") {
-                return {
-                  "PAYASYOUGO": "as_you_go",
-                  "PAYUPFRONT": "upfront"
-                }[infos.introductoryPricePaymentModeIOS];
+                switch(infosAsSubscription.introductoryPricePaymentModeIOS || "") {
+                  case "PAYASYOUGO": return "as_you_go";
+                  case "PAYUPFRONT": return "upfront";
+                  case "FREETRIAL": return "free_trial";
+                  default: return 'as_you_go';
+                }
               }
               // Android
               else if (this.platform == "android") {
                 return "as_you_go";
               }
+              return "as_you_go";
             })(),
             // Duration of an introductory cycle specified in the ISO 8601 format
             subscriptionIntroDuration: (() => {
@@ -508,10 +579,14 @@ class Iaphub {
       };
 
       var oldUser = this.user;
-      this.user = {
-        productsForSale: data.productsForSale.map((product) => formatProduct(product, true)).filter((product) => product),
-        activeProducts: data.activeProducts.map((product) => formatProduct(product, false))
+      const user = {
+        productsForSale: data.productsForSale.map((product: IapHubProductInformation) => formatProduct(product, true)).filter((product) => product),
+        activeProducts: data.activeProducts.map((product: IapHubProductInformation) => formatProduct(product, false))
       };
+
+      //force assign in the object
+      this.user = user;
+
       this.userFetchDate = new Date();
       // Check if the user has been updated, if that's the case trigger the 'onUserUpdate' event
       if (oldUser && JSON.stringify(oldUser) != JSON.stringify(this.user)) {
@@ -520,15 +595,15 @@ class Iaphub {
       // Update pricing
       try {
         await this.setPricing(
-          [].concat(this.user.productsForSale).concat(this.user.activeProducts)
+          [].concat(user.productsForSale).concat(user.activeProducts)
         );
       } catch (err) {
         console.error(err);
       }
       // Resolve promises
-      this.userFetchPromises.forEach((promise) => promise.resolve(this.user));
+      this.userFetchPromises.forEach((promise) => promise.resolve(user));
     }
-    catch (err) {
+    catch (err: any) {
       this.userFetchPromises.forEach((promise) => promise.reject(err));
     }
 
@@ -539,7 +614,7 @@ class Iaphub {
   /*
    * Set user tags
    */
-  async setUserTags(tags) {
+  public async setUserTags(tags: IapHubUserTags) {
     // The user id has to be set
     if (!this.userId) {
       throw this.error("User id required", "user_id_required");
@@ -552,7 +627,7 @@ class Iaphub {
     // Post tags
     try {
       await this.request("post", "", {tags: tags});
-    } catch (err) {
+    } catch (err: any) {
       this.userTagsProcessing = false;
       throw this.error(
         `Set user tags failed (Err: ${err.message})`,
@@ -567,7 +642,7 @@ class Iaphub {
   /*
    * Set device params
    */
-  setDeviceParams(params) {
+  setDeviceParams(params: IapHubDeviceParams) {
     var deviceParams = {};
     var hasChange = false;
 
@@ -586,10 +661,13 @@ class Iaphub {
     }
   }
 
-  /*
-   * Restore purchases
+  /***
+   * Call the restore method to restore the user purchases
+   *
+   * ℹ️ You should display a restore button somewhere in your app (usually on the settings page).
+   * ℹ️ If you logged in using the device id, an user using a new device will have to restore its purchases since the device id will be different.
    */
-  async restore() {
+  public async restore(): Promise<void> {
     // The user id has to be set
     if (!this.userId) {
       throw this.error("User id required", "user_id_required");
@@ -600,7 +678,7 @@ class Iaphub {
     this.isRestoring = true;
     try {
       var availablePurchases = await RNIap.getAvailablePurchases();
-      var purchases = [];
+      var purchases: Purchase[] = [];
 
       // Filter duplicate receipts
       availablePurchases.forEach((purchase) => {
@@ -612,9 +690,9 @@ class Iaphub {
       // Process receipts
       await purchases.reduce(async (promise, purchase) => {
         await promise;
-        await this.processReceipt({date: new Date(), purchase: purchase, context: 'restore'});
+        await this.processReceipt({date: new Date(), purchase, context: 'restore'});
       }, Promise.resolve());
-    } catch (err) {
+    } catch (err: any) {
       this.isRestoring = false;
       throw this.error(
         `Restore failed (Err: ${err.message})`,
@@ -626,10 +704,10 @@ class Iaphub {
     this.userFetchDate = null;
   }
 
-  /*
+  /***
    * Present ios code redemption sheet
    */
-  async presentCodeRedemptionSheetIOS() {
+  async presentCodeRedemptionSheetIOS(): Promise<void> {
     await RNIap.presentCodeRedemptionSheetIOS();
   }
 
@@ -642,7 +720,7 @@ class Iaphub {
     // Pause the queues on iOS
     // It is necessary to do it like that because an interrupted purchase on iOS will trigger first an error and then a purchase when the action is completed
     if (this.platform == 'ios') {
-      clearTimeout(this.resumeQueuesTimeout);
+      !!this.resumeQueuesTimeout && clearTimeout(this.resumeQueuesTimeout);
       this.pauseQueues();
     }
   }
@@ -653,7 +731,7 @@ class Iaphub {
   async onForeground() {
     // Resume the queues on iOS after 10 secs
     if (this.platform == 'ios') {
-      clearTimeout(this.resumeQueuesTimeout);
+      !!this.resumeQueuesTimeout && clearTimeout(this.resumeQueuesTimeout);
       this.resumeQueuesTimeout = setTimeout(() => {
         this.resumeQueues();
       }, 10000);
@@ -686,7 +764,7 @@ class Iaphub {
    * Get receipt token of purchase
    * @param {Object} purchase Purchase
    */
-  getReceiptToken(purchase) {
+  private getReceiptToken(purchase: any): string {
     return this.platform == "android" ? purchase.purchaseToken : purchase.transactionReceipt;
   }
 
@@ -694,11 +772,11 @@ class Iaphub {
    * Set pricing
    * @param {Array} products Array of products
    */
-  async setPricing(products) {
+  async setPricing(products: IapHubProductInformation[]) {
     var productsPricing = products
     .filter((product) => product.priceAmount && product.priceCurrency)
     .map((product) => {
-      var item = {
+      var item: ProductPricing = {
         id: product.id,
         price: product.priceAmount,
         currency: product.priceCurrency
@@ -710,9 +788,10 @@ class Iaphub {
       return item;
     });
     // Compare with the last pricing
-    if (this.productsPricing) {
+    const inObject = this.productsPricing;
+    if (!!inObject) {
       var sameProducts = productsPricing.filter((productPricing) => {
-        return this.productsPricing.find((item) => {
+        return inObject.find((item) => {
           return (item.id == productPricing.id) &&
                  (item.price == productPricing.price) &&
                  (item.currency == productPricing.currency) &&
@@ -736,7 +815,7 @@ class Iaphub {
    * Process an error
    * @param {Object} err Error
    */
-  processError(err) {
+  processError(err: ExtendedError|RNIap.PurchaseError) {
     var errors = {
       // Unknown error
       "E_UNKNOWN": "unknown",
@@ -762,7 +841,7 @@ class Iaphub {
       "E_DEFERRED_PAYMENT": "deferred_payment"
     };
     // Transform error
-    var error = this.error(err.message, errors[err.code] || "unknown");
+    var error = this.error(err.message, errors[err.code || ""] || "unknown");
     // Reject buy request if active
     if (this.buyRequest) {
       var request = this.buyRequest;
@@ -770,7 +849,11 @@ class Iaphub {
       this.buyRequest = null;
       // Support android deferred subscription replace
       // After an android deferred subscription replace the listenner is called with an empty list of purchases which is causing the error
-      if (this.platform == 'android' && request.prorationMode == 'deferred' && err.message.indexOf('purchases are null') != -1) {
+      if (this.platform == 'android' && request.prorationMode == 'deferred' && (err.message || "").indexOf('purchases are null') != -1) {
+        if (!this.user) {
+          request.reject(this.error("Invalid internal state", "user_state_required"))
+          return;
+        }
         var product = this.user.productsForSale.find((product) => product.sku == request.sku);
         request.resolve(product);
       }
@@ -785,17 +868,20 @@ class Iaphub {
    * Process a receipt
    * @param {Object} purchase Purchase
    */
-  async processReceipt(opts = {}) {
-    var receipt = {
+  async processReceipt(opts?: InternalReceipt) {
+    if (!opts) return []; //empty because invalid
+
+    var receipt: IapHubReceipt = {
       token: this.getReceiptToken(opts.purchase),
       sku: opts.purchase.productId,
-      context: opts.context || 'refresh'
+      context: opts.context || 'refresh',
+      isRestore: false
     };
-    var newTransactions = [];
-    var oldTransactions = [];
+    var newTransactions: IapHubProductInformation[] = [];
+    var oldTransactions: IapHubProductInformation[] = [];
     var shouldFinishReceipt = false;
     var productType = null;
-    var error = null;
+    var error: ExtendedError|null = null;
 
     // Process buy request
     if (this.buyRequest) {
@@ -813,7 +899,7 @@ class Iaphub {
     // Filter receipts that do not need to the validated with the server
     if (this.lastReceiptInfos &&
         this.lastReceiptInfos.token == receipt.token &&
-        this.lastReceiptInfos.date > new Date(opts.date - 500) &&
+        this.lastReceiptInfos.date > new Date(opts.date.getTime() - 500) &&
         receipt.context == 'refresh') {
           if (this.lastReceiptInfos.shouldFinishReceipt) {
             await this.finishReceipt(opts.purchase, this.lastReceiptInfos.productType);
@@ -849,13 +935,13 @@ class Iaphub {
       }
       // Otherwise it is another error
       else {
-        error = this.error("Receipt validation failed because of an unexpected error", "unknown", {response: response});
+        error = this.error("Receipt validation failed because of an unexpected error", "unknown", {response});
         shouldFinishReceipt = false;
       }
     }
     // If it fails we won't finish the receipt
-    catch (err) {
-      error = this.error("Receipt request to IAPHUB failed", "receipt_request_failed", {err: err});
+    catch (err: any) {
+      error = this.error("Receipt request to IAPHUB failed", "receipt_request_failed", {err});
     }
     // Finish receipt
     if (shouldFinishReceipt) {
@@ -869,17 +955,17 @@ class Iaphub {
     // Emit receipt processed event
     try {
       var newTransactionsOverride = await this.emitReceiptProcessed(error, receipt);
-      if (Array.isArray(newTransactionsOverride)) {
+      if (newTransactionsOverride && Array.isArray(newTransactionsOverride)) {
         newTransactions = newTransactionsOverride;
         // If we had an error previously, ignore it
         error = null;
       }
-    } catch (err) {
+    } catch (err: any) {
       error = err;
     }
     // Resolve buy request if active
     if (this.buyRequest) {
-      var transaction = null;
+      var transaction: IapHubProductInformation|undefined = undefined;
       var request = this.buyRequest;
       // Delete saved request
       this.buyRequest = null;
@@ -911,12 +997,22 @@ class Iaphub {
       }
       // Otherwise resolve with the transaction
       else {
-        var product = this.user.productsForSale.find((product) => product.sku == transaction.sku);
-        request.resolve({...product, ...transaction});
+        if (!this.user) {
+          request.reject(this.error("Invalid internal state", "user_state_required"))
+          return;
+        }
+
+        if (!transaction) {
+          request.reject(this.error("Invalid internal state", "receipt_invalid"));
+        } else {
+          const { sku } = transaction;
+          var product = this.user.productsForSale.find((product) => product.sku == sku);
+          request.resolve({...product, ...transaction});
+        }
       }
     }
     // Save receipt infos
-    this.lastReceiptInfos = {date: opts.date, token: receipt.token, shouldFinishReceipt: shouldFinishReceipt, productType: productType};
+    this.lastReceiptInfos = {date: opts.date, token: receipt.token, shouldFinishReceipt, productType};
     // Refresh user
     try {
       await this.fetchUser();
@@ -933,7 +1029,7 @@ class Iaphub {
    * @param {Array} newTransactions Array of new transactions
    * @param {Array} oldTransactions Array of old transactions
    */
-  async detectProductType(sku, newTransactions, oldTransactions) {
+  async detectProductType(sku: string, newTransactions: IapHubTransaction[], oldTransactions: IapHubTransaction[]) {
     var productType = null;
 
     // Try to get the product type from the user productsForSale
@@ -969,8 +1065,8 @@ class Iaphub {
    * @param {Object} purchase Purchase
    * @param {String} productType Product type
    */
-  async finishReceipt(purchase, productType) {
-    var shouldBeConsumed = undefined;
+  async finishReceipt(purchase: RNIap.Purchase, productType?: IapHubProductTypes|null) {
+    var shouldBeConsumed: boolean|undefined = undefined;
 
     if (this.platform == "android") {
       // If we didn't find the product type we cannot finish the transaction properly
@@ -981,7 +1077,7 @@ class Iaphub {
         );
       }
       // We have to consume 'consumable' and 'subscription' types (The subscription because it is a managed product on android that an user should be able to buy again in the future)
-      var shouldBeConsumed = (["consumable", "subscription"].indexOf(productType) != -1) ? true : false;
+      shouldBeConsumed = (["consumable", "subscription"].indexOf(productType) != -1) ? true : false;
       // If the purchase has already been ackknowledged, no need to finish the transaction (otherwise react-native-iap will throw an error)
       if (!shouldBeConsumed && purchase.isAcknowledgedAndroid) return;
     }
@@ -999,13 +1095,13 @@ class Iaphub {
   /*
    * Api request to IAPHUB
    */
-  async request(type, url = "", params = {}, options = {}) {
-    var opts = {
+  async request(type: "get"|"post"|"put"|"delete", url = "", params: any = {}, options: {timeout?:  number} = {}) {
+    var opts: any = {
       method: type,
       headers: {},
       timeout: options.timeout || 6000,
       retryDelay: 1000,
-      retryOn: (attempt, error, response) => {
+      retryOn: (attempt: number, error: Error, response: {status: number}) => {
         if (attempt < 3 && (error != null || response.status >= 500)) {
           return true;
         }
@@ -1048,7 +1144,7 @@ class Iaphub {
     });
 
     var text = null;
-    var json = {};
+    var json: any = {};
     var response = null;
 
     try {
@@ -1058,7 +1154,7 @@ class Iaphub {
       );
       text = await response.text();
       json = JSON.parse(text);
-    } catch (err) {
+    } catch (err: any) {
       throw this.error(
         `Network error, request to the Iaphub API failed (${err.message})`,
         "network_error",
@@ -1078,12 +1174,12 @@ class Iaphub {
   /*
    * Emit receipt processed event
    */
-  async emitReceiptProcessed(...params) {
-    if (!this.onReceiptProcessed) return;
+  private async emitReceiptProcessed(error?: ExtendedError|null, receipt?: IapHubReceipt|null): Promise<IapHubProductInformation[]|null> {
+    if (!this.onReceiptProcessed) return null;
     var transactions = null
 
     try {
-      transactions = await this.onReceiptProcessed(...params);
+      transactions = await this.onReceiptProcessed(error, receipt);
     } catch (err) {
       console.error(err);
     }
@@ -1093,14 +1189,8 @@ class Iaphub {
   /*
    * Create error
    */
-  error(message, code, params) {
-    var err = new Error(message);
-
-    err.code = code;
-    err.params = params;
-    return err;
+  private error(message: string = "generic", code: IapHubPurchaseErrorCodes = "generic", params?: ParamsError): ExtendedError {
+    return Object.assign(new Error(message), { code, params });
   }
 
 }
-
-export default new Iaphub();
